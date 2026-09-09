@@ -28,12 +28,12 @@ Work in this order:
 3. Use §11 as the per-notification field requirement list when writing queries.
 4. Run §12 validation before anything is wired to Slack. These notifications are DMs to
    leadership; a bad first send is expensive. §12 now carries measured volumes.
-5. Bring §9 open items back to the requester (Will Eastwood, willea@monday.com). O2 (the AI
-   usage metric) and O13 (close-date notification volume) are the two that need a decision
-   before the relevant notification can ship.
+5. Bring any remaining **Open** rows in §9 back to the requester as they come up during the
+   build. As of 2026-09-08 the only ones left are O6, O8, O11, O12 and O14 — all "assumption in
+   place," none blocking.
 
-**Nothing in §10 is blocking any more.** The remaining blockers are product decisions, not
-data discovery.
+**Nothing is blocking the build any more.** Every §10 discovery item and every product decision
+that had a toggle depending on it (O2, O9, O10, O13) is resolved.
 
 ---
 
@@ -51,7 +51,7 @@ const { id, email, name, photo, permissions, roles } = getBigBrainAPI().contextS
 | Purpose | Join |
 | --- | --- |
 | Preferences row | `notification_preferences.user_email` |
-| Salesforce user — scope, hierarchy | `bigbrain.l3.dim_salesforce_users.email` |
+| Salesforce user — scope filters | `bigbrain.l3.dim_salesforce_users.email` |
 | Salesforce user — timezone | `bigbrain.l1.salesforce_user.DATA:"TimeZoneSidKey"` (§10.9) |
 | Slack DM target | `users.lookupByEmail` → Slack user ID |
 
@@ -59,19 +59,85 @@ Identity comes from the session, so nobody can read or write anyone else's prefe
 nobody can subscribe a colleague to DMs.
 
 ### Scope — whose records a person is notified about
-Reporting line, resolved **recursively** through the Salesforce `Manager` field.
+**Superseded 2026-09-08.** The original design resolved scope automatically from the recipient's
+own position in the reporting line — you saw yourself and everyone below you, full stop. The
+requester replaced this: **scope is now four explicit multi-select filters on the z2h
+preferences page — region, sub-region, role and manager — set independently of who the
+recipient is or where they sit in the org chart.** Nothing about scope runs off the recipient's
+own identity or hierarchy position any more; every recipient, including a manager, must
+explicitly choose what they want to see.
 
 ```
-in_scope(recipient) = { recipient } ∪ { all direct and indirect reports of recipient }
+in_scope(recipient) = { owner : owner.region     ∈ recipient.scope_regions     ∨ scope_regions     = ∅ }
+                     ∩ { owner : owner.sub_region ∈ recipient.scope_sub_regions ∨ scope_sub_regions = ∅ }
+                     ∩ { owner : owner.role_bucket ∈ recipient.scope_roles      ∨ scope_roles       = ∅ }
+                     ∩ { owner : owner.manager_id ∈ recipient.scope_managers    ∨ scope_managers    = ∅ }
 ```
 
-An event is in a recipient's scope when the **owner** of the opportunity, account or lead is in
-that set. A rep with no reports therefore sees only their own book; a manager sees their whole
-downline including themselves.
+An event is in scope when the **owner** of the opportunity, account or lead — resolved via that
+owner's own row on `dim_salesforce_users` — passes all four filters. Within one filter, multiple
+selections are OR'd (any match qualifies). Across the four filters it's AND. **An empty filter
+places no restriction on that dimension** — leaving all four empty (the default, §6) means
+every owner qualifies, which is intentional and harmless on its own: every notification toggle
+also defaults off, so an unconfigured new user still receives nothing.
 
-Implement as a recursive CTE over `dim_salesforce_users` on the manager relationship. Guard
-against cycles (self-referencing or circular manager records do occur in Salesforce) with a
-depth cap.
+Real values, verified against the warehouse (owners of currently-open opportunities,
+`bigbrain.l4.dim_opportunities`, 2026-09-08):
+
+- **Region** (`business_region`) — `NAM`, `EMEA`, `APJ`, `LATAM`, `Global`.
+- **Sub-region** (`business_sub_region`) — 27 values including `US`, `UK&I`, `ANZ`, `FR`,
+  `Brazil`, `DACH`, `Benelux`, `Nordics`, `IL`, `Mexico`, `SEA`, `India`, `ME`, `CEE/CIS`,
+  `Africa`, `Japan`, and several `<Region> - Multiple` / `Rest of the world` catch-alls.
+- **Role** (`monday_owner_business_role`, bucketed to **exactly three options — the only three
+  the requester wants shown**, revised 2026-09-08):
+
+  | Selectable option | Raw values it collapses |
+  | --- | --- |
+  | `AE` | `AE` |
+  | `AM` | `AM`, `Commercial AM`, `Scale AM`, `Territory AE` |
+  | `Partner` | `Partner`, `CPM` |
+
+  Every other raw role (`People Manager`, `Overlay`, `SDR`, `High-Touch CSM`, and the rest of
+  the long tail in §10.11) is **excluded from the Role picklist entirely** — not grouped into a
+  fourth "Other" option, dropped. It still participates internally so cascading (below) stays
+  correct for the other three filters, it just never appears as something to pick.
+- **Manager** — **195 distinct front-line managers** of a current open-opportunity owner
+  (`dim_salesforce_users` self-joined on `manager_id`), all with a populated `full_name`. This
+  is a flat filter on the owner's **direct** manager, not a recursive downline from the manager
+  you pick — see §9 O16.
+
+**The four filters cascade against each other.** Selecting `EMEA` in Region immediately narrows
+Sub-region to only EMEA's values (`UK&I`, `FR`, `DACH`, …) — and the same narrowing runs in
+every direction at once: picking a Role also narrows which Managers and Regions can still be
+picked, and so on. Mechanically this means the z2h page doesn't ask the warehouse for four
+independent distinct-value lists; it asks for one list of every `(region, sub_region, role,
+manager)` combination that actually owns an open opportunity, and derives each picklist's
+visible options by filtering that combined list against whatever is already selected in the
+*other* three. If narrowing one filter invalidates a value already selected in another, that
+stale value is silently dropped rather than saved invisibly.
+
+Full derivation, including the exact queries, is in §10.11.
+
+Two things this change removes, now that scope no longer depends on the org chart at all:
+
+- The recursive CTE, its cycle guard and its depth cap (§1 previously required these; they are
+  gone, not just unused).
+- The D11 concern about an inactive manager severing the reporting line mid-walk — there is no
+  walk to sever any more. D11's `is_active` finding is still used, just for a different purpose:
+  see the next section.
+
+### Active reps only — per-rep groupings
+**Requester instruction, 2026-09-08: every per-rep breakdown considers active reps only.**
+
+This is unrelated to the scope filters above — it governs which rows appear *inside* a digest a
+recipient already qualifies for. When a notification lists or groups by rep — the three Hygiene
+digests and both Leads notifications, all of which are explicitly "grouped by rep" in §7 —
+filter the rep set to `dim_salesforce_users.is_active = 1` (confirmed available, §10.9) before
+grouping. A departed rep's records don't get their own row; they simply don't appear.
+
+Big-deal notifications are per-opportunity, not per-rep groupings, so this rule doesn't change
+them — an opportunity still owned by a departed rep still fires its Big-deal DM to that rep's
+former manager, which is correct: the deal itself hasn't gone anywhere.
 
 ### Channel and segment
 No filter. Both channels — direct sales and partner — and all segments are in scope.
@@ -200,6 +266,11 @@ Stored in z2h's own storage.
 notification_preferences
   user_email            string   PK
   updated_at            timestamp
+  -- scope filters, added 2026-09-08 — see §1. Arrays of strings, ALL default empty (= unrestricted)
+  scope_regions          string[]
+  scope_sub_regions      string[]
+  scope_roles            string[]   -- bucketed values, e.g. 'AM' represents 4 raw roles — §1, §9 O16
+  scope_managers         string[]   -- each entry is the manager's dim_salesforce_users.user_id
   -- category sliders, USD
   big_deals_arr_threshold     integer  default 10000
   renewals_arr_threshold      integer  default 10000
@@ -228,10 +299,15 @@ notification_preferences
   de-emphasise it in that state.
 
 ### z2h page requirements
+- **A Scope section at the top of the page** (§1), above the notification categories: four
+  multi-select filters — Region, Sub-region, Role, Manager — each searchable, each backed by
+  live option lists read from the warehouse at page load (not hardcoded), since role and manager
+  names in particular will drift as the org changes. An empty selection is explained inline as
+  "everyone" rather than left to look broken or unset.
 - Five category sections matching §7, each listing its notifications as individual toggles.
 - Sliders shown at category level for Big deals and Renewals only.
-- Loads the current user's saved row on mount; creates a defaults row (everything off) on first
-  visit.
+- Loads the current user's saved row on mount; creates a defaults row (everything off, no scope
+  filters set) on first visit.
 - Shows the resolved identity — name and email — so the user can see whose preferences they are
   editing.
 - Save is explicit, with a confirmation state.
@@ -298,12 +374,20 @@ Evaluated against the **full funnel** stage order, now resolved in §10.4:
   > `renewal`" — is not implementable: that field does not exist in the warehouse, and the real
   > `source_type` column holds only `Inbound` / `Outbound`. See §10.10.
 - **Filters**
-  - Renewal date within a **rolling 60-day forward window** from the run date.
+  - **Renewal date (= the renewal opportunity's `close_date`) — either within the rolling 60-day
+    forward window, or already in the past.** Extended 2026-09-08 at the requester's instruction
+    to also surface **late renewals**: `close_date <= today + 60 days`, with no lower bound. A
+    renewal one day overdue and a renewal a year overdue are both included — there is no cutoff
+    on how late is too late to still appear here, deliberately.
   - `account_current_arr >= renewals_arr_threshold`, using **account-level total ARR**.
   - Excludes renewals already closed, already renewed, or churned:
-    `renewal_stage NOT IN ('Closed Won','Churn') AND is_closed = 0`.
+    `renewal_stage NOT IN ('Closed Won','Churn') AND is_closed = 0`. This is what actually caps
+    the late-renewal tail in practice — a renewal only keeps appearing here for as long as it
+    stays open with an unresolved `renewal_stage`; the "no lower bound on lateness" point above
+    only matters for renewals nobody has closed out yet.
 - **Rolling window** — a renewal reappears in each weekly digest until it leaves the window or
-  becomes excluded. This is intended, not a duplication bug: it is a standing worklist.
+  becomes excluded. This is intended, not a duplication bug: it is a standing worklist, and that
+  is now true on both sides of today, not just the forward side.
 - **Message** — count, plus a digest listing account, account current ARR, renewal date, owner
   and Salesforce link, **sorted by ARR descending**. A **spreadsheet export** is attached to the DM.
 
@@ -314,7 +398,8 @@ Evaluated against the **full funnel** stage order, now resolved in §10.4:
 
 **Recipient — the manager.** Each of the three is a per-rep digest: one message per offence
 category, listing each report and their offending records grouped by rep. A subscriber with no
-reports receives their own records only.
+reports receives their own records only. **Active reps only** — filter the rep set to
+`dim_salesforce_users.is_active = 1` before grouping (§1).
 
 #### HY_CLOSE_DATE_IN_PAST
 - **Cadence** — weekly, Thursday 10:00 local.
@@ -330,13 +415,37 @@ reports receives their own records only.
 - **Message** — grouped by rep: opportunity, ARR, stage, close date, Salesforce link.
 
 #### HY_NO_ACTIVITY_LAST_WEEK
+**Redefined 2026-09-08 — replaces the fixed-7-days-for-everyone rule with a stage-dependent SLA
+and a future-meeting exemption.**
+
 - **Cadence** — weekly, Thursday 10:00 local.
-- **Population** — all open opportunities with `close_date` in the **current fiscal quarter**.
-- **Condition** — no activity in the last 7 days, where activity is **either** a Gong-recorded
-  call **or** any logged activity (email, meeting, task), matched at **either the opportunity or
-  the account** level. Activity found at either level clears the flag.
+- **Population** — open opportunities with `close_date` within a **rolling 60-day forward
+  window** from the run date. (No longer "current fiscal quarter" — see §9 O17, which also
+  means D12's fiscal-calendar resolution is no longer used by anything in this spec; it's kept
+  in §10 as a resolved fact, not removed, in case a future notification needs it.)
+- **Future-meeting exemption** — excluded entirely, regardless of the SLA below, if there is a
+  **future-dated meeting already on the calendar**: `dim_activities.activity_type = 'meeting'
+  AND activity_timestamp > now`, matched at either the opportunity or the account level (§10.6),
+  consistent with how "activity" is matched everywhere else below. A meeting already booked
+  means the rep doesn't need chasing, even if the deal has gone quiet up to today.
+- **Activity SLA — stage-dependent, replacing the old flat 7-day rule for everyone:**
+
+  | Stage | Required activity cadence | Included in this notification when |
+  | --- | --- | --- |
+  | `Qualified`, `Evaluation` | every **14 days** | most recent activity is more than 14 days old, or there has never been one |
+  | `Validation`, `Buying process` | every **7 days** | most recent activity is more than 7 days old, or there has never been one |
+
+  "Activity" keeps its existing definition unchanged: **either** a Gong-recorded call **or**
+  any logged activity (email, meeting, task), matched at **either the opportunity or the
+  account** level — activity found at either level, of either kind, resets the clock.
+
+  **Open question — `Pre Qualified` stage isn't named in either bucket.** The instruction gave
+  cadences for exactly four stages; the full open-stage set (§10.4) has five. Implemented here
+  as folding `Pre Qualified` into the 14-day bucket, matching how HY_EARLY_STAGE_CLOSE_DATE_UPCOMING
+  already treats `Pre Qualified` as "early stage" alongside `Qualified` and `Evaluation` — but
+  this is this session's assumption, not a stated instruction. See §9 O17.
 - **Message** — grouped by rep: opportunity, ARR, stage, close date, days since last activity,
-  Salesforce link.
+  which SLA bucket applied (7-day or 14-day), Salesforce link.
 
 ---
 
@@ -352,9 +461,19 @@ reports receives their own records only.
 
 #### EX_AI_USAGE_INDICATION
 - **Cadence** — daily, 09:00 local.
-- **Definition — NOT YET DECIDED. See §9 O2 for the six options tabled.** Build the toggle and
-  the delivery path, but do not implement a metric until the requester selects one.
-- **Message** — "*N* accounts showing AI usage indication", plus an attached **CSV**.
+- **Trigger — resolved 2026-09-08: credit exhaustion (§9 O2 option 1).** An account's AI credit
+  usage crosses **≥80% of its current billing-cycle allowance**:
+  `bigbrain.l3.fact_accounts_ai_daily.pct_cap_used >= 0.80 AND is_active_cycle = 1` (§10.7).
+  80% is the primary number named in the option description, not the "or 100%" alternative also
+  mentioned there — confirm if 100% (i.e. `is_over_cap = 1`) was actually intended.
+- **Look-back** — accounts crossing the threshold since the previous send for that recipient, the
+  same "since previous send" semantics as EX_CRM_TRIAL_ACTIVATED.
+- **Message** — "*N* accounts showing AI usage indication", plus an attached **CSV** listing
+  account, current ARR, owner, `pct_cap_used`, and Salesforce link.
+
+**Not built this round**: option 2 (first AI activation) was recommended as a second, separately
+toggled notification. Out of scope for this pass — no toggle exists for it yet; revisit if the
+requester wants it.
 
 #### EX_MEMBERS_EXCEEDING_SEATS
 - **Cadence** — weekly, Thursday 10:00 local.
@@ -365,7 +484,8 @@ reports receives their own records only.
 ---
 
 ### Category: Leads
-Both notifications: **inbound leads only**.
+Both notifications: **inbound leads only**, and both are per-rep groupings — **active reps
+only** (§1).
 
 #### LD_LEADS_RECEIVED_SUMMARY
 - **Cadence** — weekly, Thursday 10:00 local.
@@ -390,7 +510,9 @@ Both notifications: **inbound leads only**.
 1. **z2h preferences page** — 14 toggles (default off), 2 sliders, save/load keyed on session
    email. Independent of all Kremer discovery, so it can start immediately.
 2. **Preferences storage** plus a read API the schedulers can call.
-3. **Scope resolver** — recursive `Manager` walk over `dim_salesforce_users`, with cycle guard.
+3. **Scope filter matching** — apply the four §1 preference filters (region, sub-region, role,
+   manager) as a flat equality/membership check against each record's owner. No recursion, no
+   cycle guard — those were needed only under the superseded hierarchy model.
 4. **Slack delivery layer** — email → Slack user ID, DM send, file attachment, `notification_log`
    write. Build the log before the first real send.
 5. **Hourly Big-deals job** — L2 diff plus §5 dedup. Highest value and highest risk; the dedup
@@ -408,21 +530,27 @@ Both notifications: **inbound leads only**.
 | # | Item | Blocks | Status |
 | --- | --- | --- | --- |
 | O1 | Renewal window length | RN_UPCOMING_RENEWALS | **Resolved — 60 days, rolling.** |
-| O2 | AI usage indication definition | EX_AI_USAGE_INDICATION | **Open** — options below. |
+| O2 | AI usage indication definition | EX_AI_USAGE_INDICATION | **Resolved 2026-09-08 — option 1, credit exhaustion.** Implemented at the ≥80% threshold named in the option (§7). |
 | O3 | Per-user timezone source | All daily/weekly schedules | **Resolved and located** — `l1.salesforce_user.DATA:"TimeZoneSidKey"`, fallback `Europe/London`. Follow-on risk in O11. |
 | O4 | Ordered stage list | BD_STAGE_CHANGE | **Resolved in principle** — full funnel order; actual stage names to be read from the warehouse (§10 D4). |
 | O5 | Kremer table and field names | All queries | **Resolved 2026-09-08** — §10 complete. D13 alone remains, as O9. |
 | O6 | Renewals slider range | Preferences page | **Open, assumption in place** — same as Big deals ($10k–$500k, $5k step, $10k default). Account total ARR may warrant a higher ceiling; revisit once real ARR distribution is visible. |
 | O7 | Slack app scopes | Delivery layer | **Resolved** — `chat:write`, `users:read.email`, `files:write` approved. |
 | O8 | Closed-lost threshold | BD_CLOSED_LOST | **Open, assumption in place** — the Big-deals slider is applied to closed-lost as a category-wide filter. The requester's wording ("all closed-lost opportunities") may have meant unfiltered. |
-| O9 | Salesforce instance URL | Links in every message | **Open, trivial** — not stored in the warehouse. One line from the requester's browser address bar, e.g. `https://<instance>.lightning.force.com/lightning/r/Opportunity/<id>/view`. |
-| O10 | CRM trial-start event source | EX_CRM_TRIAL_ACTIVATED | **Open** — the AI usage tables were located (§10.7) but a CRM trial-start event plus a paid-CRM entitlement flag was not confirmed. The only §10 item still needing warehouse work. |
+| O9 | Salesforce instance URL | Links in every message | **Resolved 2026-09-08** — `https://monday.lightning.force.com/`. Deep-link pattern: `https://monday.lightning.force.com/lightning/r/Opportunity/<id>/view` (swap the object name for Account / Lead). |
+| O10 | CRM trial-start event source + paid-CRM entitlement flag | EX_CRM_TRIAL_ACTIVATED | See §10.11 — resolved 2026-09-08. |
 | O11 | Non-UK users defaulted to `GMT` | Daily/weekly send times | **Open, mitigation in place** — `GMT` is treated as unset and falls back to `Europe/London` (§3). A minority of GMT-defaulted users are demonstrably not in the UK (9 APAC, 7 Brazil, 5 Mexico, 4 US, 4 Australia, long tail) and would get UK-time DMs. Prefer `country`/`office_region` where populated. |
 | O12 | Renewals threshold basis | RN_UPCOMING_RENEWALS | **Open** — §7 filters on the account's total ARR. `arr_to_renew` on the renewal opportunity is the ARR actually at stake and is arguably the better filter. Requester's call. |
-| O13 | Close-date notification volume | BD_CLOSE_DATE_CHANGE | **Open — needs a decision before launch.** Measured at ~124 qualifying events per day globally at the $10k floor, roughly 3× every other Big-deal notification combined. See §12.4. |
+| O13 | Close-date notification volume | BD_CLOSE_DATE_CHANGE | **Resolved 2026-09-08 — accepted as-is.** The requester confirmed the ~124/day global figure is fine since delivery is per-recipient, not global (§12.4). No threshold or digest change made. |
 | O14 | `recognized = true` on wins | BD_CLOSED_WON | **Open, assumption in place** — implemented as `recoginzed_arr > 0`, which excludes about 41% of closed-won opportunities (16,519 of 28,074 over 90 days have it populated). Confirm that suppressing unrecognised wins is intended. |
+| O15 | Active reps only in per-rep groupings | Hygiene (3), Leads (2) | **Resolved 2026-09-08** — requester instruction. `dim_salesforce_users.is_active = 1` filters the rep set before grouping (§1). |
+| O16 | Manager filter — direct report vs. whole downline | The scope model, all 14 notifications | **Open, assumption in place.** §1 replaced the recursive hierarchy walk with four flat picklist filters, one of them "manager." Implemented as a **flat filter on the owner's direct `manager_id`** — picking a manager shows only people who report to them directly, not their whole downline. The instruction that prompted this change ("rather than running based on your hierarchy") reads most naturally as dropping recursion everywhere, including here, but the alternative reading — pick a manager, see their entire downline, i.e. the old recursive behaviour with an explicit instead of an automatic root — is plausible enough to flag rather than silently assume away. If the recursive reading is what's wanted, the fix is confined to how the manager filter is *applied* at send-time (a CTE instead of an equality check); the picklist itself, and everything else in §1, is unaffected either way. |
+| O17 | `Pre Qualified` stage not named in the HY_NO_ACTIVITY_LAST_WEEK SLA | HY_NO_ACTIVITY_LAST_WEEK | **Open, assumption in place.** The 2026-09-08 redefinition gave a 14-day cadence for `Qualified`/`Evaluation` and a 7-day cadence for `Validation`/`Buying process` — four of the five open stages. `Pre Qualified` was left out of the instruction. Folded into the 14-day bucket here, matching how HY_EARLY_STAGE_CLOSE_DATE_UPCOMING already treats it as "early stage." Confirm, or state the intended cadence (including "no SLA at all for Pre Qualified" as a valid answer). |
 
 ### O2 — options tabled for the AI usage indication
+**Resolved 2026-09-08 — the requester chose option 1, credit exhaustion.** Implemented in §7
+EX_AI_USAGE_INDICATION. Kept here for the record of what was considered and why.
+
 Ordered by strength of commercial signal. Which are buildable depends on §10 D8.
 
 1. **Credit exhaustion** — account has consumed ≥80% (or 100%) of its monthly AI credit
@@ -454,7 +582,7 @@ later once volumes are observable.
 ## 10. Data discovery — RESOLVED 2026-09-08
 
 Completed against the live warehouse (Snowflake, `BIGBRAIN` database) by a Kremer-enabled
-session on 2026-09-08. Every placeholder is now a verified table and column except D13.
+session on 2026-09-08. Every placeholder is now a verified table and column.
 Row counts, freshness and volume figures were measured on that date.
 
 ### 10.1 Resolved sources
@@ -473,7 +601,7 @@ Row counts, freshness and volume figures were measured on that date.
 | D10 | `<LEADS_TABLE>` | `bigbrain.l4.dim_leads` | 5.35M rows. §10.8. |
 | D11 | `dim_salesforce_users` columns | `bigbrain.l3.dim_salesforce_users` **+** `bigbrain.l1.salesforce_user` | Timezone is **not** on the dim. §10.9. |
 | D12 | Fiscal calendar | **Fiscal quarter = calendar quarter** | Verified on four dates spanning four quarters. Use `LAST_DAY(day,'quarter')`, or `days_till_end_of_quarter` on `fact_opportunities_daily`. |
-| D13 | Salesforce instance URL | **Still open** | Not stored anywhere in the warehouse. One-line answer from the requester's browser address bar — see §9 O9. |
+| D13 | Salesforce instance URL | **Resolved 2026-09-08** | `https://monday.lightning.force.com/` — not in the warehouse, given directly by the requester. See §9 O9. |
 
 ### 10.2 Opportunity field map (D3)
 
@@ -654,8 +782,9 @@ any per-rep grouping unless excluded.
 `user_id`, `email`, `full_name`, `is_active`, `manager_id`, `business_role`, `sub_region`,
 `business_region`, `team`, `segment`, `office`, `office_region`, `country`.
 
-That is everything §1's scope resolver needs — `manager_id` self-joins to `user_id` for the
-recursive walk, and `is_active` handles the D11 inactive-manager concern.
+`manager_id` self-joins to `user_id` to build the §1 manager picklist (every manager of a
+current opportunity owner) and to evaluate the manager filter itself — both flat lookups now,
+not a walk. `is_active` still matters for the §1 active-reps-only grouping rule.
 
 **It has no timezone column.** Timezone is only in the raw object:
 
@@ -665,7 +794,8 @@ bigbrain.l1.salesforce_user.DATA:"TimeZoneSidKey"::string
 ```
 
 Populated for 3,120 of 3,120 active users. `ManagerId` is present for 3,090 of 3,120 — the 30
-without one are the top of the tree, so the recursive walk must terminate on NULL, not assume it.
+without one are the top of the tree (no manager to filter on, which is fine now that scope
+doesn't walk the chain — see §1).
 
 **The DST problem §3 anticipated is real and bigger than expected.** The distribution of
 `TimeZoneSidKey` for active users:
@@ -720,6 +850,97 @@ One further judgement call for the requester rather than a correction: `arr_to_r
 renewal opportunity is the ARR actually at stake in that renewal, and is arguably a better filter
 for RN_UPCOMING_RENEWALS than the account's total ARR that §7 specifies. Raised as O12.
 
+### 10.11 Scope filter data (added 2026-09-08 — supersedes the §1 hierarchy model)
+
+All four picklists are derived from open opportunities on `bigbrain.l4.dim_opportunities`
+(`is_closed = 0`), joined to `bigbrain.l3.dim_salesforce_users` twice — once for the owner, once
+self-joined on `manager_id` for the owner's manager.
+
+**Region and sub-region come straight off the opportunity, no owner join needed.**
+`business_region` and `business_sub_region` on `dim_opportunities` already match the resolved
+owner's region in 99.7%+ of rows (spot-checked against `monday_owner_business_region`, which
+exists as a separate column and agrees with `business_region` in every case checked bar two rare
+edge combinations) — so there was no need to go back to `dim_salesforce_users` for these two.
+
+Real region → sub-region pairs on currently-open opportunities:
+
+| Region | Sub-regions |
+| --- | --- |
+| `NAM` | `US` |
+| `EMEA` | `UK&I`, `FR`, `DACH`, `Benelux`, `Nordics`, `IL`, `ME`, `CEE/CIS`, `Africa`, `Iberia`, `IT`, `IL (&GR)`, `Greece`, `EMEA - Multiple` |
+| `APJ` | `ANZ`, `SEA`, `India`, `North Asia`, `Japan` |
+| `LATAM` | `Brazil`, `Mexico`, `SoLA`, `NoLA`, `MCLA`, `Rest of the world` |
+| `Global` | `Multiple` |
+
+**Role bucketing.** `monday_owner_business_role` on the same table, joined to real open-opp
+owner counts, 2026-09-08:
+
+| Raw role | Open opps | Distinct owners | Bucket |
+| --- | --- | --- | --- |
+| `CPM` | 33,938 | 86 | `Partner` |
+| `AE` | 20,741 | 222 | `AE` |
+| `Territory AE` | 10,123 | 97 | `AM` |
+| `AM` | 7,745 | 104 | `AM` |
+| `People Manager` | 7,002 | 105 | excluded |
+| `Scale AM` | 6,045 | 32 | `AM` |
+| `Commercial AM` | 5,577 | 46 | `AM` |
+| `Partner` | 3 | 3 | `Partner` |
+| everything else (Hybrid Overlay, Renewal, SDR, Overlay, High-Touch CSM, GTM/RevOps/Program Manager, and ~20 more single-to-double-digit-owner roles) | — | — | excluded |
+
+The `AE`/`AM`/`Partner` bucketing is the requester's explicit instruction, given twice — first
+naming `Commercial AM`, `Scale AM` and `Territory AE` as folding into `AM`, then naming `CPM` as
+folding into `Partner` alongside the literal `Partner` role, and confirming the Role picklist
+should show **only** those three options. `People Manager` — the largest single excluded role by
+owner count (105, i.e. opportunities still sitting on a manager's own book) — is deliberately not
+a fourth option; it is simply not selectable, though it, like every excluded role, still
+participates in cascading so selecting a Region or Manager isn't skewed by silently dropping
+those rows first.
+
+**Manager.** Self-join `dim_salesforce_users` on `manager_id`, restricted to managers of a
+current open-opportunity owner:
+
+```sql
+SELECT DISTINCT m.user_id AS manager_id, m.full_name AS manager_name
+FROM bigbrain.l4.dim_opportunities o
+JOIN bigbrain.l3.dim_salesforce_users u ON u.user_id = o.monday_owner_id
+JOIN bigbrain.l3.dim_salesforce_users m ON m.user_id = u.manager_id
+WHERE o.is_closed = 0
+ORDER BY m.full_name
+```
+
+**195 distinct managers**, all with `full_name` populated. Every one carries the role
+`People Manager` — expected, and irrelevant to the Role picklist above since Manager and Role
+are independent filter dimensions (a `People Manager`'s own book, if they have one, would be
+excluded by the Role filter regardless of who manages them).
+
+**The combined query the app actually runs** (`backend/handlers/get_scope_options.js`) is a
+single pass returning one row per distinct `(region, sub_region, bucketed_role, manager_id,
+manager_name)` combination, bucketing role with a `CASE` and using `LEFT JOIN` on the manager so
+an owner with no manager still contributes a region/sub-region/role row (with a null manager)
+rather than being dropped:
+
+```sql
+SELECT DISTINCT
+  o.business_region AS region,
+  o.business_sub_region AS sub_region,
+  CASE
+    WHEN o.monday_owner_business_role = 'AE' THEN 'AE'
+    WHEN o.monday_owner_business_role IN ('AM', 'Commercial AM', 'Scale AM', 'Territory AE') THEN 'AM'
+    WHEN o.monday_owner_business_role IN ('Partner', 'CPM') THEN 'Partner'
+    ELSE 'Other'
+  END AS role,
+  m.user_id AS manager_id,
+  m.full_name AS manager_name
+FROM bigbrain.l4.dim_opportunities o
+JOIN bigbrain.l3.dim_salesforce_users u ON u.user_id = o.monday_owner_id
+LEFT JOIN bigbrain.l3.dim_salesforce_users m ON m.user_id = u.manager_id
+WHERE o.is_closed = 0
+```
+
+`'Other'` is a real bucket value in this result set — it is what makes cascading correct for
+owners in an excluded role — but the Role picklist's own option list is hardcoded to offer only
+`AE`, `AM` and `Partner`, never `Other`.
+
 ---
 
 ## 11. Per-notification field requirements
@@ -750,9 +971,13 @@ required on every one and are not repeated.
 These are DMs to sales leadership. Validate against real data with delivery disabled, then dry-run,
 then enable.
 
-1. **Scope resolver** — pick three users at different levels (rep, front-line manager, director)
-   and confirm the resolved downline matches the org chart. Check that an inactive manager
-   mid-hierarchy does not sever the line (D11).
+1. **Scope filters** — pick a few real filter combinations and confirm the matched owner set is
+   exactly right: one region alone, one region + one role together (confirm AND across
+   dimensions), two sub-regions in the same picklist (confirm OR within a dimension), and all
+   four filters left empty (confirm it matches everyone, not no one — an empty-array bug here
+   is the kind that silently sends nothing to anyone). Separately confirm the picklists
+   cascade: selecting a region in the z2h page narrows the sub-region options to that region's
+   real values, and a stale selection elsewhere clears rather than saving invisibly (§1, §10.11).
 2. **Dedup** — replay a day of real opportunity history through the Big-deals job, using
    `bigbrain.l3.scd_opportunities` as the history source (§2). Assert that
    **every** opportunity reaching Closed Won produced exactly one notification and no
@@ -778,12 +1003,16 @@ then enable.
    often in the same save as a stage advance, where §5.1 precedence will suppress it, but far from
    always.
 
-   These are org-wide totals; a given recipient sees only their downline. A front-line manager
-   will see a small fraction, but a director or VP with a large downline could plausibly receive
-   10–30 close-date DMs a day from this one notification. Recommend either a minimum shift
-   threshold (≥7 days, or crossing a month/quarter boundary — `push_forward_month_count` and
-   `push_quarter_count` already exist on `dim_opportunities`) or demoting close-date changes to a
-   daily digest. Logged as O13.
+   These are org-wide totals; a given recipient sees only whatever their own §1 scope filters
+   select. Someone with broad or empty filters could plausibly receive 10–30 close-date DMs a
+   day from this one notification; someone with a narrow region/role/manager combination sees
+   far less.
+
+   **Resolved as O13, 2026-09-08 — accepted as-is.** The requester confirmed this is fine because
+   delivery is per-recipient scope, not the global total above; no minimum-shift threshold or
+   digest change was requested. Ship BD_CLOSE_DATE_CHANGE per §7 unchanged. If real per-recipient
+   volume turns out higher than expected once the scope resolver is live, revisit then rather
+   than pre-emptively narrowing it now.
 
    Other measured populations, for scale: RN_UPCOMING_RENEWALS matches **9,280** renewals in a
    rolling 60-day window ($126.3M `arr_to_renew`) before the ARR threshold;
